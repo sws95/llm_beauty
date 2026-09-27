@@ -22,6 +22,9 @@ ID 드롭아웃(+drop): 학습 시 id_dropout 확률로 상품 ID 부분을 꺼�
   filled     ID + 브랜드 + 세그먼트 + 판매자∪자동 추출 속성
              (효능은 메인(상품명)과 설명 속 효능을 별도 필드로, 피부타입 'all' 제외, 흔한 라벨은 IDF로 가중치 낮춤)
   attr_only  ID 없이 브랜드 + 자동 추출 속성만 (콜드스타트 상한 참고)
+  emb        ID + 브랜드 + 세그먼트 + 상품 텍스트 임베딩 (build_text_emb.py로 생성)
+  filled_emb filled + 상품 텍스트 임베딩 (구조화 속성과 임베딩을 함께)
+  emb_knn    학습 없음: 유저가 산 상품들의 임베딩 평균과 가까운 상품 추천 (문장 임베딩 유사도 베이스라인)
   이름 뒤에 +drop 을 붙이면 ID 드롭아웃 적용 (예: seller+drop, filled+drop), +drop0.3 처럼 비율 지정 가능
   --active_mode: 성분을 all(전체) / main(상품명의 핵심 성분만) / split(핵심과 나머지를 별도 필드) 중 선택
   --seeds 42 43 44: 시드마다 반복해 평균 ± 표준편차 보고
@@ -156,6 +159,22 @@ def build_features(items, variant, drop=None, idf=True, active_mode="all"):
     return idx, w, len(vocab) + 1
 
 
+def load_text_emb(items, path=None):
+    """build_text_emb.py 결과를 상품 순서에 맞춰 로드. 없는 상품은 0 벡터"""
+    path = path or os.path.join(DATA, "text_emb.npy")
+    emb = np.load(path).astype(np.float32)
+    asins = pd.read_parquet(os.path.join(os.path.dirname(path), "text_emb_asins.parquet"))["parent_asin"]
+    pos = {a: k for k, a in enumerate(asins)}
+    out = np.zeros((len(items), emb.shape[1]), dtype=np.float32)
+    hit = 0
+    for r, a in enumerate(items):
+        if a in pos:
+            out[r] = emb[pos[a]]
+            hit += 1
+    print(f"텍스트 임베딩 {emb.shape[1]}차원, 상품 {hit:,}/{len(items):,}개 매칭")
+    return out
+
+
 # ─────────────────────────────── 평가 ───────────────────────────────
 def evaluate(score_fn, train_u, train_i, test_u, test_i, item_train, n_users, n_items, k, device,
              batch=1024, pool=None, max_users=None, seed=0):
@@ -211,7 +230,7 @@ def evaluate(score_fn, train_u, train_i, test_u, test_i, item_train, n_users, n_
 
 # ─────────────────────────────── 모델 ───────────────────────────────
 def make_model(n_users, n_items, n_tokens, dim, use_id, feat_idx, feat_w, has_train, device,
-               id_dropout=0.0):
+               id_dropout=0.0, text=None):
     import torch
     import torch.nn as nn
 
@@ -233,10 +252,21 @@ def make_model(n_users, n_items, n_tokens, dim, use_id, feat_idx, feat_w, has_tr
             self.fi = torch.tensor(feat_idx, device=device)
             self.fw = torch.tensor(feat_w, device=device).unsqueeze(-1)
             self.mask = torch.tensor(has_train, device=device, dtype=torch.float32).unsqueeze(-1)
+            self.E = None
+            if text is not None:   # 고정된 텍스트 임베딩을 학습 가능한 선형층으로 투영
+                self.E = torch.tensor(text, device=device)
+                self.P = nn.Linear(text.shape[1], dim, bias=False)
+                self.Pb = nn.Linear(text.shape[1], 1, bias=False)
+                nn.init.normal_(self.P.weight, std=0.05)
+                nn.init.zeros_(self.Pb.weight)
 
         def item_vec(self, i):
             v = (self.T(self.fi[i]) * self.fw[i]).sum(1)
             b = (self.Tb(self.fi[i]) * self.fw[i]).sum(1)
+            if self.E is not None:
+                e = self.E[i]
+                v = v + self.P(e)
+                b = b + self.Pb(e)
             if use_id:   # 학습 기록 없는 상품은 ID 부분 0
                 m = self.mask[i]
                 if self.training and id_dropout > 0:   # ID 드롭아웃: 속성만으로 점수를 매기도록
@@ -256,7 +286,7 @@ def make_model(n_users, n_items, n_tokens, dim, use_id, feat_idx, feat_w, has_tr
 
 
 def fit(args, name, n_users, n_items, feat, use_id, id_dropout, tr_u, tr_i, epochs, device,
-        val=None):
+        val=None, text=None):
     """epochs만큼 학습. val=(u, i)가 있으면 에폭마다 검증 Recall을 재서 최적 에폭과 점수 반환"""
     import torch
     import torch.nn.functional as F
@@ -266,7 +296,7 @@ def fit(args, name, n_users, n_items, feat, use_id, id_dropout, tr_u, tr_i, epoc
     has_train = np.zeros(n_items, dtype=bool)
     has_train[np.unique(tr_i)] = True
     item_cnt = np.bincount(tr_i, minlength=n_items)
-    model = make_model(n_users, n_items, n_tok, args.dim, use_id, fidx, fw, has_train, device, id_dropout)
+    model = make_model(n_users, n_items, n_tok, args.dim, use_id, fidx, fw, has_train, device, id_dropout, text)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     train_items = np.unique(tr_i)
     U, I = torch.tensor(tr_u, device=device), torch.tensor(tr_i, device=device)
@@ -310,7 +340,7 @@ def fit(args, name, n_users, n_items, feat, use_id, id_dropout, tr_u, tr_i, epoc
     return model, best_ep, best
 
 
-def train_eval(name, args, data, feat=None, use_id=True, id_dropout=0.0):
+def train_eval(name, args, data, feat=None, use_id=True, id_dropout=0.0, text=None):
     import torch
     device = "cuda" if torch.cuda.is_available() else "cpu"
     (train_u, train_i, test_u, test_i, item_train, n_users, n_items, val) = data
@@ -318,11 +348,12 @@ def train_eval(name, args, data, feat=None, use_id=True, id_dropout=0.0):
         feat = (np.zeros((n_items, 1), dtype=np.int64), np.zeros((n_items, 1), dtype=np.float32), 1)
     # 1) 검증으로 최적 에폭 찾기
     _, best_ep, best = fit(args, name, n_users, n_items, feat, use_id, id_dropout,
-                           val["fit_u"], val["fit_i"], args.max_epochs, device, val=(val["u"], val["i"]))
+                           val["fit_u"], val["fit_i"], args.max_epochs, device, val=(val["u"], val["i"]),
+                           text=text)
     print(f"  → 최적 에폭 {best_ep} (검증 Recall {best:.4f}), 전체 학습 데이터로 다시 학습")
     # 2) 전체 학습 데이터로 최적 에폭만큼 다시 학습
     model, _, _ = fit(args, name, n_users, n_items, feat, use_id, id_dropout,
-                      train_u, train_i, best_ep, device)
+                      train_u, train_i, best_ep, device, text=text)
     model.eval()
     with torch.no_grad():
         V, B = model.all_items()
@@ -332,6 +363,25 @@ def train_eval(name, args, data, feat=None, use_id=True, id_dropout=0.0):
                     pool=item_train < args.cold_max)
     res.update({"cold_recall": cold["recall"], "cold_ndcg": cold["ndcg"], "cold_users": cold["users"],
                 "best_epoch": best_ep})
+    return res
+
+
+def knn_eval(args, data, text):
+    """유저 프로필 = 학습 기간에 산 상품 임베딩의 평균, 점수 = 프로필과 상품 임베딩의 코사인"""
+    import torch
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    (train_u, train_i, test_u, test_i, item_train, n_users, n_items, _) = data
+    prof = np.zeros((n_users, text.shape[1]), dtype=np.float32)
+    np.add.at(prof, train_u, text[train_i])
+    prof /= np.maximum(np.linalg.norm(prof, axis=1, keepdims=True), 1e-8)
+    P = torch.tensor(prof, device=device)
+    E = torch.tensor(text, device=device)
+    score_fn = lambda ub: P[ub] @ E.T
+    res = evaluate(score_fn, train_u, train_i, test_u, test_i, item_train, n_users, n_items, args.k, device)
+    cold = evaluate(score_fn, train_u, train_i, test_u, test_i, item_train, n_users, n_items, args.k, device,
+                    pool=item_train < args.cold_max)
+    res.update({"cold_recall": cold["recall"], "cold_ndcg": cold["ndcg"], "cold_users": cold["users"],
+                "best_epoch": "-"})
     return res
 
 
@@ -370,6 +420,7 @@ def main():
     ap.add_argument("--reg", type=float, default=1e-3)
     ap.add_argument("--k", type=int, default=20)
     ap.add_argument("--seeds", type=int, nargs="+", default=[42])
+    ap.add_argument("--text_emb", default=None, help="텍스트 임베딩 경로 (기본 data_skincare/text_emb.npy)")
     ap.add_argument("--active_mode", choices=["all", "main", "split"], default="split")
     args = ap.parse_args()
 
@@ -402,22 +453,32 @@ def main():
 
     keys = ["recall", "ndcg", "cold_recall", "cold_ndcg"] + [f"R_{l}" for _, _, l in POP_BINS]
     results = []
+    text_cache = None
     for name, variant, drop in runs:
         base, drop_p = variant, 0.0
         if "+drop" in variant:
             base, tail = variant.split("+drop")
             drop_p = float(tail) if tail else args.id_dropout
-        feat = None
-        if base not in ("pop", "id"):
-            feat = build_features(items, base, drop, idf=not args.no_idf, active_mode=args.active_mode)
+        feat, text = None, None
+        uses_text = base in ("emb", "filled_emb", "emb_knn")
+        if uses_text:
+            if text_cache is None:
+                text_cache = load_text_emb(items, args.text_emb)
+            text = text_cache
+        feat_base = {"emb": "brand", "filled_emb": "filled"}.get(base, base)
+        if base not in ("pop", "id", "emb_knn"):
+            feat = build_features(items, feat_base, drop, idf=not args.no_idf, active_mode=args.active_mode)
         per_seed = []
-        for seed in (args.seeds if base != "pop" else args.seeds[:1]):
+        for seed in (args.seeds if base not in ("pop", "emb_knn") else args.seeds[:1]):
             args.seed = seed
             print(f"\n=== {name} (seed {seed}) ===")
             if base == "pop":
                 r = pop_eval(args, data)
+            elif base == "emb_knn":
+                r = knn_eval(args, data, text)
             else:
-                r = train_eval(name, args, data, feat, use_id=(base != "attr_only"), id_dropout=drop_p)
+                r = train_eval(name, args, data, feat, use_id=(base != "attr_only"), id_dropout=drop_p,
+                               text=text)
             per_seed.append(r)
             print({k: round(r[k], 4) for k in keys})
         agg = {"model": name, "n_seeds": len(per_seed)}
