@@ -27,7 +27,7 @@ import extract_per_image as epi
 from extract_per_image import DATA, IDX, OCR_PRED, attach, fill_rate, load_samples, print_scores, select_products
 from extract_qwen import BENEFITS, FORMS, SKINS, _to_text, load_model
 from prepare_eval_sample import BENEFIT_C, SKIN_C, norm_form, norm_multi
-from rules_v2 import BENEFIT2, FORM2, SKIN2, label_v2, split_sections, title_form
+from rules_v2 import BENEFIT2, FORM2, SKIN2, label_v2, split_sections, title_form, title_skin
 
 OUT = os.path.join(DATA, "llm_text.jsonl")
 FIELDS = [("form", "form"), ("skin", "skin_type"), ("benefit", "benefits")]
@@ -317,6 +317,7 @@ def v2_agg(asins, titles):
     for a, g in hires_index(asins).groupby("parent_asin"):
         agg[a] = epi.aggregate([label_v2(ocr.get((a, int(k)), "")) for k in g["order"]])
         agg[a]["form"] = title_form(titles.get(a)) or agg[a]["form"]
+        agg[a]["skin"] = sorted(set(agg[a]["skin"]) | set(title_skin(titles.get(a))))
     return agg
 
 
@@ -567,7 +568,15 @@ def run_compare_score(args):
     except UnicodeDecodeError:
         df = pd.read_csv(path, encoding="cp949", dtype=str).fillna("")
     df = df[df["확인(Y)"].str.strip().str.upper() == "Y"]
-    to_set = lambda x: {t.strip().lower() for t in str(x).split(",") if t.strip()}
+    base4 = {"dry", "oily", "combination", "normal"}
+
+    def to_set(x, attr=None):
+        s = {t.strip().lower() for t in str(x).split(",") if t.strip()}
+        # 기본 네 가지를 다 나열 = 모든 피부 → 'all'로 통일.
+        # 'all'이 있으면 기본 네 가지는 이미 포함된 것으로 보고 제거 (민감성·여드름성·중년은 유지)
+        if attr == "피부타입" and (base4 <= s or "all" in s):
+            s = (s - base4) | {"all"}
+        return s
     print(f"확인된 줄 {len(df)}개 (상품 {df['상품ID'].nunique()}개)\n")
 
     for grp_name, g in [("전체", df), ("정답있음", df[df["구분"] == "정답있음"]), ("빈칸", df[df["구분"] == "빈칸"])]:
@@ -584,7 +593,7 @@ def run_compare_score(args):
                     continue
                 tp = fp = fn = answered = 0
                 for pred, truth in zip(a[m], a["사람 정답"]):
-                    p, t = to_set(pred), to_set(truth)
+                    p, t = to_set(pred, attr), to_set(truth, attr)
                     answered += bool(p)
                     tp, fp, fn = tp + len(p & t), fp + len(p - t), fn + len(t - p)
                 prec = tp / (tp + fp) if tp + fp else float("nan")

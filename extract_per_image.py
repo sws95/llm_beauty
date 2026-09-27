@@ -220,7 +220,7 @@ def run_eval(args):
     groups = dict(tuple(idx.groupby("parent_asin")))
     titles = {**dict(zip(ev["parent_asin"], ev["title"])), **dict(zip(ms["parent_asin"], ms["title"]))}
     if args.source == "ocr2":
-        from rules_v2 import title_form
+        from rules_v2 import title_form, title_skin
 
     main_agg = None
     for name, sel in CONFIGS.items():
@@ -229,8 +229,9 @@ def run_eval(args):
             s = sel(g)
             if len(s):
                 agg[a] = aggregate(s["parsed"].tolist())
-                if args.source == "ocr2":   # 제형은 상품명 우선, 없으면 OCR 큰 글씨
+                if args.source == "ocr2":   # 제형은 상품명 우선, 피부타입은 상품명 + OCR 합집합
                     agg[a]["form"] = title_form(titles.get(a)) or agg[a]["form"]
+                    agg[a]["skin"] = sorted(set(agg[a]["skin"]) | set(title_skin(titles.get(a))))
         if name.startswith("고해상도"):
             main_agg = agg
         e = attach(ev, agg)

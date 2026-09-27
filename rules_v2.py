@@ -27,7 +27,7 @@ SKIN2 = _c([
     ("oily", r"\boily\b"),
     ("combination", r"\bcombination\b"),
     ("normal", r"\bnormal\b"),
-    ("sensitive", r"\bsensitive\b"),
+    ("sensitive", r"\b(sensitive|irritated|reactive|eczema|rosacea)\b"),
     ("acne_prone", r"\b(acne|blemish)[- ]?prone\b|\bacne\b"),
     ("mature", r"\b(mature|aging|ageing)\b"),
 ])
@@ -119,6 +119,12 @@ def label_v2(tagged):
         out[c] = sorted(v)
         out[f"{c}_g"] = sorted(v)
     return out
+
+
+def title_skin(title):
+    """상품명에서 피부타입 ("Advanced Dry Skin Therapy" → dry). 'skin' 문맥 규칙은 본문과 같음"""
+    t = re.sub(r"\b[a-z]+[- ]free\b", " ", (title or "").lower())
+    return sorted(skin_labels(t))
 
 
 def title_form(title):
